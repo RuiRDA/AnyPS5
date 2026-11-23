@@ -21,26 +21,102 @@
  */
 
 #include "prx/libSceNKWebKit/include/GraphemeClusterExports.hpp"
-#include "prx/libc/include/General.hpp"
 
+#include <unicode/uchar.h>
+#include <unicode/utf16.h>
 #include <stdexcept>
 
 namespace {
 
 using NKWebKit::WtfAbi::StringView;
 
-char16_t Latin1Unit(const StringView& string, unsigned index) {
-    return string.is8Bit ? static_cast<const unsigned char*>(string.data)[index] : static_cast<const char16_t*>(string.data)[index];
+struct GraphemeProperties {
+    int breakClass;
+    int conjunctClass;
+    bool pictographic;
+};
+
+GraphemeProperties ReadProperties(const char16_t* text, unsigned length, unsigned& offset) {
+    UChar32 codePoint;
+    U16_NEXT(text, offset, length, codePoint);
+    return {
+        u_getIntPropertyValue(codePoint, UCHAR_GRAPHEME_CLUSTER_BREAK),
+        u_getIntPropertyValue(codePoint, UCHAR_INDIC_CONJUNCT_BREAK),
+        static_cast<bool>(u_hasBinaryProperty(codePoint, UCHAR_EXTENDED_PICTOGRAPHIC)),
+    };
 }
 
-void RequireLatin1(const StringView& string, const char* function) {
-    if (!string.data) throw std::invalid_argument("null WTF character buffer");
-    if (string.is8Bit) return;
-    const auto* characters = static_cast<const char16_t*>(string.data);
-    for (unsigned i = 0; i < string.length; ++i) {
-        if (characters[i] > 0xff) NotImplemented_nid_no_patch(function);
-    }
+bool IsControl(int breakClass) {
+    return breakClass == U_GCB_CR || breakClass == U_GCB_LF || breakClass == U_GCB_CONTROL;
 }
+
+bool BreaksBetween(const GraphemeProperties& left, const GraphemeProperties& right,
+    bool joinedConsonant, bool joinedPictograph, bool oddRegionalIndicators) {
+    const int before = left.breakClass;
+    const int after = right.breakClass;
+    if (before == U_GCB_CR && after == U_GCB_LF) return false;
+    if (IsControl(before) || IsControl(after)) return true;
+
+    if (before == U_GCB_L && (after == U_GCB_L || after == U_GCB_V || after == U_GCB_LV || after == U_GCB_LVT))
+        return false;
+    if ((before == U_GCB_LV || before == U_GCB_V) && (after == U_GCB_V || after == U_GCB_T))
+        return false;
+    if ((before == U_GCB_LVT || before == U_GCB_T) && after == U_GCB_T)
+        return false;
+
+    if (after == U_GCB_EXTEND || after == U_GCB_ZWJ || after == U_GCB_SPACING_MARK || before == U_GCB_PREPEND)
+        return false;
+    if (joinedConsonant && right.conjunctClass == U_INCB_CONSONANT) return false;
+    if (joinedPictograph && right.pictographic) return false;
+    return !(oddRegionalIndicators && after == U_GCB_REGIONAL_INDICATOR);
+}
+
+class Utf16Clusters {
+public:
+    Utf16Clusters(const char16_t* text, unsigned length)
+        : text_(text), length_(length), next_(ReadProperties(text_, length_, nextOffset_)) {}
+
+    unsigned Offset() const { return offset_; }
+
+    void Advance() {
+        enum class Conjunct { None, Consonant, Linked };
+        Conjunct conjunct = Conjunct::None;
+        bool pictographicSequence = false;
+        bool oddRegionalIndicators = false;
+        while (true) {
+            const auto current = next_;
+            offset_ = nextOffset_;
+            if (offset_ == length_) return;
+            switch (current.conjunctClass) {
+            case U_INCB_CONSONANT:
+                conjunct = Conjunct::Consonant;
+                break;
+            case U_INCB_LINKER:
+                if (conjunct != Conjunct::None) conjunct = Conjunct::Linked;
+                break;
+            case U_INCB_EXTEND:
+                break;
+            default:
+                conjunct = Conjunct::None;
+                break;
+            }
+            const bool joinedPictograph = pictographicSequence && current.breakClass == U_GCB_ZWJ;
+            pictographicSequence = current.pictographic
+                || (pictographicSequence && current.breakClass == U_GCB_EXTEND);
+            oddRegionalIndicators = current.breakClass == U_GCB_REGIONAL_INDICATOR && !oddRegionalIndicators;
+            next_ = ReadProperties(text_, length_, nextOffset_);
+            if (BreaksBetween(current, next_, conjunct == Conjunct::Linked, joinedPictograph, oddRegionalIndicators))
+                return;
+        }
+    }
+
+private:
+    const char16_t* text_;
+    unsigned length_;
+    unsigned offset_{0};
+    unsigned nextOffset_{0};
+    GraphemeProperties next_;
+};
 
 }
 
@@ -49,18 +125,32 @@ extern "C" {
 unsigned APS5_VABI _ZN3WTF19numGraphemeClustersENS_10StringViewE(StringView string) {
     unsigned stringLength = string.length;
     if (!stringLength) return 0;
-    RequireLatin1(string, __func__);
+    if (!string.data) throw std::invalid_argument("null WTF character buffer");
+    if (!string.is8Bit) {
+        Utf16Clusters clusters(static_cast<const char16_t*>(string.data), stringLength);
+        unsigned count = 0;
+        for (; clusters.Offset() < stringLength; ++count) clusters.Advance();
+        return count;
+    }
+    const auto* characters = static_cast<const unsigned char*>(string.data);
     unsigned numCRLF = 0;
-    for (unsigned i = 1; i < stringLength; ++i) numCRLF += Latin1Unit(string, i - 1) == '\r' && Latin1Unit(string, i) == '\n';
+    for (unsigned i = 1; i < stringLength; ++i) numCRLF += characters[i - 1] == '\r' && characters[i] == '\n';
     return stringLength - numCRLF;
 }
 
 unsigned APS5_VABI _ZN3WTF30numCodeUnitsInGraphemeClustersENS_10StringViewEj(StringView string, unsigned numGraphemeClusters) {
     unsigned stringLength = string.length;
     if (stringLength <= numGraphemeClusters) return stringLength;
-    RequireLatin1(string, __func__);
+    if (!string.data) throw std::invalid_argument("null WTF character buffer");
+    if (!numGraphemeClusters) return 0;
+    if (!string.is8Bit) {
+        Utf16Clusters clusters(static_cast<const char16_t*>(string.data), stringLength);
+        for (unsigned i = 0; i < numGraphemeClusters && clusters.Offset() < stringLength; ++i) clusters.Advance();
+        return clusters.Offset();
+    }
+    const auto* characters = static_cast<const unsigned char*>(string.data);
     unsigned i, j;
-    for (i = 0, j = 0; i < numGraphemeClusters && j + 1 < stringLength; ++i, ++j) j += Latin1Unit(string, j) == '\r' && Latin1Unit(string, j + 1) == '\n';
+    for (i = 0, j = 0; i < numGraphemeClusters && j + 1 < stringLength; ++i, ++j) j += characters[j] == '\r' && characters[j + 1] == '\n';
     return j + (i < numGraphemeClusters);
 }
 

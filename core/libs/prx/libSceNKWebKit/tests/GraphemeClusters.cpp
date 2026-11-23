@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <source_location>
 #include <stdexcept>
 #include <string>
@@ -43,6 +44,15 @@ void BothUnits(std::string_view text, unsigned clusters, unsigned units) {
     const StringView wide {wideText.data(), static_cast<unsigned>(wideText.size()), false};
     Require(CodeUnits(narrow, clusters) == units);
     Require(CodeUnits(wide, clusters) == units);
+}
+
+void CheckBoundaries(std::u16string_view text, std::initializer_list<unsigned> ends) {
+    const StringView view{text.data(), static_cast<unsigned>(text.size()), false};
+    Require(Clusters(view) == ends.size());
+    Require(CodeUnits(view, 0) == 0);
+    unsigned count = 0;
+    for (unsigned end : ends) Require(CodeUnits(view, ++count) == end);
+    Require(CodeUnits(view, count + 1) == text.size());
 }
 
 template<typename Function> bool Throws(Function function, std::string_view message) {
@@ -92,15 +102,16 @@ void Run() {
     Require(Throws([] { Clusters({nullptr, 2, true}); }, "null WTF character buffer"));
     Require(Throws([] { CodeUnits({nullptr, 2, false}, 1); }, "null WTF character buffer"));
 
-    const std::u16string combining = u"é";
-    const StringView combiningView {combining.data(), static_cast<unsigned>(combining.size()), false};
-    Require(Throws([&] { Clusters(combiningView); }, "not implemented"));
-    Require(Throws([&] { CodeUnits(combiningView, 1); }, "not implemented"));
-    Require(CodeUnits(combiningView, 2) == 2);
-
-    const std::u16string surrogate = u"a\U0001F600";
-    const StringView surrogateView {surrogate.data(), static_cast<unsigned>(surrogate.size()), false};
-    Require(Throws([&] { Clusters(surrogateView); }, "not implemented"));
+    CheckBoundaries(u"e\u0301", {2});
+    CheckBoundaries(u"a\U0001F600b", {1, 3, 4});
+    CheckBoundaries(u"\u1100\u1161\u11A8\u1102", {3, 4});
+    CheckBoundaries(u"\u0600\u0915\u093E", {3});
+    CheckBoundaries(u"\u0915\u094D\u0937", {3});
+    CheckBoundaries(u"\U0001F469\U0001F3FD\u200D\U0001F4BB!", {7, 8});
+    CheckBoundaries(u"\U0001F1F5\U0001F1F9\U0001F1EC\U0001F1E7\U0001F1E8", {4, 8, 10});
+    CheckBoundaries(u"e\u0301\r\n\u0301", {2, 4, 5});
+    const char16_t unpaired[]{0xd800, u'a', 0xdc00};
+    CheckBoundaries({unpaired, 3}, {1, 2, 3});
 }
 
 }
